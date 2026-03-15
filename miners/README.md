@@ -29,16 +29,28 @@ Minimum: Any GPU with 24GB+ VRAM that can run Qwen2.5-7B-Instruct via vLLM.
 
 ### 1. Register on SN97
 
+We recommend [agcli](https://github.com/unconst/agcli) (Rust, fast) for wallet and registration. btcli works too.
+
 ```bash
-# Install bittensor
+# Install agcli (Rust — fast, no Python overhead)
+cargo install --git https://github.com/unconst/agcli
+
+# Create a wallet
+agcli wallet create --name miner --password YOUR_PASSWORD --yes
+
+# Register on subnet 97 (burn registration)
+agcli subnet register-neuron 97 --wallet miner --hotkey default --password YOUR_PASSWORD --yes
+```
+
+<details>
+<summary>Alternative: using btcli (Python)</summary>
+
+```bash
 pip install bittensor
-
-# Create a wallet (follow the prompts to set wallet name and hotkey)
 btcli wallet create --wallet-name miner --hotkey default
-
-# Register on subnet 97
 btcli subnet register --wallet-name miner --hotkey default --netuid 97
 ```
+</details>
 
 ### 2. Install Dependencies
 
@@ -70,6 +82,15 @@ Key flags:
 
 Register your miner's IP and port on-chain so the validator can discover and send requests to you:
 
+```bash
+agcli serve axon --netuid 97 --ip YOUR_PUBLIC_IP --port 8091 --wallet miner --hotkey default --password YOUR_PASSWORD
+```
+
+Replace `YOUR_PUBLIC_IP` with your server's public IP and `8091` with your miner's port.
+
+<details>
+<summary>Alternative: using Python bittensor SDK</summary>
+
 ```python
 # save as set_axon.py and run: python set_axon.py
 import bittensor
@@ -81,8 +102,7 @@ axon = bittensor.axon(wallet=wallet, ip="YOUR_PUBLIC_IP", port=8091)
 success = subtensor.serve_axon(netuid=97, axon=axon)
 print("Axon registered!" if success else "Failed — check wallet and registration")
 ```
-
-Replace `YOUR_PUBLIC_IP` with your server's public IP address and `8091` with whatever port your miner is listening on.
+</details>
 
 ## Architecture
 
