@@ -52,7 +52,14 @@ btcli subnet register --wallet-name miner --hotkey default --netuid 97
 ```
 </details>
 
-### 2. Install Dependencies
+### 2. Clone the Repo
+
+```bash
+git clone https://github.com/unconst/constantinople-subnet.git
+cd constantinople-subnet/miners
+```
+
+### 3. Install Dependencies
 
 ```bash
 pip install vllm fastapi uvicorn aiohttp numpy pydantic accelerate transformers torch
@@ -61,7 +68,7 @@ pip install vllm fastapi uvicorn aiohttp numpy pydantic accelerate transformers 
 pip install nvidia-cusparselt-cu12
 ```
 
-### 3. Run the Miner
+### 4. Run the Miner
 
 ```bash
 python vllm_miner.py \
@@ -75,10 +82,10 @@ Key flags:
 - `--model`: The model to serve (must match what the validator expects)
 - `--port`: Port to expose (must match your registered axon port)
 - `--gpu-memory-utilization 0.70`: Leaves room for HF model used in hidden state extraction
-- `--hf-device cpu`: Forces the HF reference model to CPU (recommended to avoid GPU OOM)
+- `--hf-device cpu`: Forces the HF reference model to CPU (recommended for 24GB GPUs to avoid OOM). On 32GB+ GPUs, you can omit this to keep it on GPU for faster hidden state extraction
 - `--tensor-parallel-size N`: For multi-GPU setups (e.g., 2 for dual-GPU)
 
-### 4. Set Your Axon
+### 5. Set Your Axon
 
 Register your miner's IP and port on-chain so the validator can discover and send requests to you:
 
