@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Never commit agent context, chat logs, or run artifacts
+context/
+chat/
+runs/
+*.jsonl
+INBOX.md
+STATE.md
+rollout.md
+logs.txt

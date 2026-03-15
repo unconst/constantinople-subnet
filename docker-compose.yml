@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  validator:
+    image: thebes1618/constantinople-validator:latest
+    container_name: constantinople-validator
+    restart: unless-stopped
+    environment:
+      - WALLET_NAME=${WALLET_NAME:-validator}
+      - HOTKEY_NAME=${HOTKEY_NAME:-default}
+      - NETUID=${NETUID:-97}
+      - NETWORK=${NETWORK:-finney}
+      - R2_ENDPOINT=${R2_ENDPOINT}
+      - R2_BUCKET=${R2_BUCKET:-affine}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+    volumes:
+      # Mount bittensor wallets from host
+      - ${WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets:ro
+    command: >
+      --wallet ${WALLET_NAME:-validator}
+      --hotkey ${HOTKEY_NAME:-default}
+      --netuid ${NETUID:-97}
+      --network ${NETWORK:-finney}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # Watchtower auto-updates the validator container when a new image is pushed
+  watchtower:
+    image: containrrr/watchtower
+    container_name: constantinople-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_LABEL_ENABLE=true
+    command: --label-enable --interval 300
