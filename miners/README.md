@@ -100,7 +100,13 @@ Your miner exposes these endpoints (the gateway calls them automatically):
 - **Use CPU for HF model**: Always use `--hf-device cpu` to avoid GPU memory conflicts
 - **Monitor health**: Check `/health` endpoint to verify both vLLM engine and HF model are loaded
 - **Uptime matters**: Consistent uptime improves your score via Bayesian smoothing
-- **Model must match**: Currently Qwen/Qwen2.5-7B-Instruct — using a different model will fail hidden-state verification
+- **Model must match**: You **must** run `Qwen/Qwen2.5-7B-Instruct` — the validator computes reference hidden states from this exact model. Running a different model, a quantized variant, or a fine-tune will cause all hidden-state challenges to fail (cosine similarity will be near zero instead of > 0.99)
+
+## Scoring Timeline
+
+- **Epochs are 25 minutes** (1500 seconds). At the end of each epoch, miners are scored and weights are updated.
+- **Challenge rate**: Adaptive, 10% floor. You'll see at least 5 challenges per epoch once the validator has enough organic traffic.
+- **New miner grace period**: Bayesian smoothing starts you with 2 virtual passes, so you won't be penalized for low sample count early on. Scores stabilize after ~5 real challenges.
 
 ## Troubleshooting
 

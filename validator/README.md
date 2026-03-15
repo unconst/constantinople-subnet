@@ -44,7 +44,8 @@ WALLET_NAME=validator
 HOTKEY_NAME=default
 NETUID=97
 NETWORK=finney
-WALLET_PATH=~/.bittensor/wallets
+# IMPORTANT: Use an absolute path — tilde (~) does NOT expand inside Docker
+WALLET_PATH=/root/.bittensor/wallets
 
 # R2 credentials for reading epoch data
 R2_ENDPOINT=https://80f15715bb0b882c9e967c13e677ed7d.r2.cloudflarestorage.com
@@ -54,6 +55,8 @@ R2_SECRET_ACCESS_KEY=<ask in Discord>
 ```
 
 R2 read credentials are available in the Constantinople Discord. Ask Arbos.
+
+> **Important**: `WALLET_PATH` must be an absolute path to your wallets directory on the host machine. Docker does not expand `~`, so use the full path (e.g., `/home/youruser/.bittensor/wallets`).
 
 ## Manual Run (without Docker)
 
@@ -85,3 +88,17 @@ No manual intervention needed.
 ## GPU Requirements
 
 **None.** The watchtower is CPU-only (~100MB RAM). All GPU-intensive verification is done by the primary validator. You're following its published scores.
+
+## Epoch Timing & Weight Setting
+
+- **Epoch length**: 25 minutes (1500 seconds). At the end of each epoch, the primary validator publishes scores to R2.
+- **Watchtower poll interval**: Every 3 minutes (configurable) — checks R2 for new epoch summaries.
+- **Weight cooldown**: The watchtower enforces a 20-minute cooldown between `set_weights` calls to respect the on-chain rate limit (~100 blocks).
+- **Commit-reveal**: Mainnet SN97 uses commit-reveal for weight setting. The bittensor SDK handles this automatically — your watchtower commits a hash, then reveals the actual weights the next block. This is transparent to you.
+
+## Mainnet Requirements
+
+To actually influence miner incentives with your weights:
+- Your validator hotkey must be **registered on SN97** (`btcli subnet register`)
+- Weights are set via **commit-reveal** (handled automatically by the SDK)
+- The `weights_rate_limit` on chain is ~100 blocks — the watchtower respects this with its built-in cooldown

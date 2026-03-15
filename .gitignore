@@ -1,4 +1,15 @@
+# Secrets
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+credentials.json
+secrets.json
+*.db
+
+# Python
 __pycache__/
 *.pyc
 *.egg-info/
