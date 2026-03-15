@@ -33,11 +33,11 @@ Minimum: Any GPU with 24GB+ VRAM that can run Qwen2.5-7B-Instruct via vLLM.
 # Install bittensor
 pip install bittensor
 
-# Create a wallet
-btcli wallet create --wallet miner
+# Create a wallet (follow the prompts to set wallet name and hotkey)
+btcli wallet create --wallet-name miner --hotkey default
 
 # Register on subnet 97
-btcli subnet register --wallet miner --hotkey default --netuid 97
+btcli subnet register --wallet-name miner --hotkey default --netuid 97
 ```
 
 ### 2. Install Dependencies
@@ -68,11 +68,21 @@ Key flags:
 
 ### 4. Set Your Axon
 
-Make sure your registered axon IP and port match where your miner is running:
+Register your miner's IP and port on-chain so the validator can discover and send requests to you:
 
-```bash
-btcli subnet update-axon --wallet miner --hotkey default --netuid 97 --ip YOUR_IP --port 8091
+```python
+# save as set_axon.py and run: python set_axon.py
+import bittensor
+
+wallet = bittensor.wallet(name="miner", hotkey="default")
+subtensor = bittensor.subtensor(network="finney")
+axon = bittensor.axon(wallet=wallet, ip="YOUR_PUBLIC_IP", port=8091)
+
+success = subtensor.serve_axon(netuid=97, axon=axon)
+print("Axon registered!" if success else "Failed — check wallet and registration")
 ```
+
+Replace `YOUR_PUBLIC_IP` with your server's public IP address and `8091` with whatever port your miner is listening on.
 
 ## Architecture
 
