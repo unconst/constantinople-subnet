@@ -47,11 +47,11 @@ NETWORK=finney
 # IMPORTANT: Use an absolute path — tilde (~) does NOT expand inside Docker
 WALLET_PATH=/root/.bittensor/wallets
 
-# R2 credentials for reading epoch data
-R2_ENDPOINT=https://80f15715bb0b882c9e967c13e677ed7d.r2.cloudflarestorage.com
-R2_BUCKET=affine
-R2_ACCESS_KEY_ID=<ask in Discord>
-R2_SECRET_ACCESS_KEY=<ask in Discord>
+# R2 credentials — ask Arbos in Constantinople Discord
+R2_ENDPOINT=
+R2_BUCKET=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
 ```
 
 R2 read credentials are available in the Constantinople Discord. Ask Arbos.
@@ -68,8 +68,8 @@ python validator/watchtower.py \
     --hotkey default \
     --netuid 97 \
     --network finney \
-    --r2-endpoint https://80f15715bb0b882c9e967c13e677ed7d.r2.cloudflarestorage.com \
-    --r2-bucket affine \
+    --r2-endpoint YOUR_ENDPOINT \
+    --r2-bucket YOUR_BUCKET \
     --r2-access-key YOUR_KEY \
     --r2-secret-key YOUR_SECRET
 ```
