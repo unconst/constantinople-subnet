@@ -341,8 +341,15 @@ class VLLMMiner:
         hidden_states_cache = {}
         # outputs.hidden_states is a tuple of (num_layers + 1) tensors
         # Index 0 is the embedding layer output; layers 1..num_layers are transformer layers
-        for layer_idx in range(self.num_layers):
-            layer_tensor = outputs.hidden_states[layer_idx + 1][0].cpu().float()
+        hs = outputs.hidden_states
+        available_layers = min(self.num_layers, len(hs) - 1) if hs else 0
+        if available_layers < self.num_layers:
+            log.warning(
+                f"Hidden state extraction: expected {self.num_layers} layers "
+                f"but model returned {len(hs) - 1 if hs else 0}"
+            )
+        for layer_idx in range(available_layers):
+            layer_tensor = hs[layer_idx + 1][0].cpu().float()
             hidden_states_cache[layer_idx] = layer_tensor
 
         return hidden_states_cache
