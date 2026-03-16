@@ -1,3 +1,9 @@
 bittensor>=9.0.0
 boto3>=1.26.0
 numpy>=1.24.0
+torch>=2.0.0
+transformers>=4.30.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+aiohttp>=3.8.0
+pydantic>=2.0.0

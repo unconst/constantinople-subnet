@@ -20,10 +20,18 @@ Constantinople uses a challenge-response protocol to verify that miners are runn
 
 ## Run a Validator
 
-See [validator/README.md](validator/README.md). No GPU required — the watchtower follows published epoch scores.
+See [validator/README.md](validator/README.md) for full details. Two options:
 
+**Watchtower (no GPU)** — follow published scores:
 ```bash
 docker compose up -d
+```
+
+**Full Validator (GPU)** — run independent hidden-state verification:
+```bash
+pip install -r validator/requirements.txt
+python validator/hardened_gateway.py --port 8081 --model Qwen/Qwen2.5-7B-Instruct --netuid 97 --discover
+python validator/audit_validator.py --port 8082 --model Qwen/Qwen2.5-7B-Instruct --wallet validator --hotkey default --netuid 97
 ```
 
 ## Run a Miner
