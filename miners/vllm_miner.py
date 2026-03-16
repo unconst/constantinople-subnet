@@ -41,11 +41,49 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vllm_miner")
+
+# -- Response Signing (hotkey authentication) ----------------------------------
+# Proves this miner owns the registered hotkey for its UID.
+# Prevents impersonation attacks where an attacker points their axon at another
+# miner's IP:port to steal rewards without running a GPU.
+
+_MINER_KEYPAIR = None  # bittensor.Keypair, loaded from wallet at startup
+_MINER_SS58 = ""       # ss58 address of the hotkey
+
+
+def _load_wallet(wallet_name: str, hotkey_name: str, wallet_path: str = None):
+    """Load bittensor wallet and extract hotkey Keypair for response signing."""
+    global _MINER_KEYPAIR, _MINER_SS58
+    try:
+        import bittensor as bt
+        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name, path=wallet_path or "~/.bittensor/wallets")
+        _MINER_KEYPAIR = wallet.hotkey
+        _MINER_SS58 = wallet.hotkey.ss58_address
+        log.info(f"[SIGN] Wallet loaded: {wallet_name}/{hotkey_name} → {_MINER_SS58}")
+    except Exception as e:
+        log.warning(f"[SIGN] Failed to load wallet ({wallet_name}/{hotkey_name}): {e}")
+        log.warning("[SIGN] Response signing DISABLED — miner will be rejected by validators requiring signatures")
+
+
+def _sign_response(request_id: str, response_body: bytes) -> dict:
+    """Sign sha256(request_id + response_body) with the miner hotkey.
+
+    Returns headers dict: {X-Miner-Hotkey: ss58, X-Miner-Signature: hex}
+    or empty dict if signing unavailable.
+    """
+    if not _MINER_KEYPAIR:
+        return {}
+    msg = hashlib.sha256(request_id.encode() + response_body).digest()
+    sig = _MINER_KEYPAIR.sign(msg)
+    return {
+        "X-Miner-Hotkey": _MINER_SS58,
+        "X-Miner-Signature": sig.hex(),
+    }
 
 
 # -- Request/Response Models (identical to real_miner.py) ----------------------
@@ -790,11 +828,14 @@ def _get_body_hash(request: Request) -> str:
     body_hash = request.headers.get("X-Body-Hash", "")
     return body_hash
 
-@app.post("/inference", response_model=InferenceResponse)
+@app.post("/inference")
 async def inference(request: InferenceRequest, raw_request: Request):
     if not _verify_validator_token(raw_request, "/inference", request.request_id or "", _get_body_hash(raw_request)):
         raise HTTPException(status_code=401, detail="unauthorized")
-    return await miner.run_inference(request)
+    result = await miner.run_inference(request)
+    body = result.model_dump_json().encode()
+    headers = _sign_response(result.request_id, body)
+    return JSONResponse(content=json.loads(body), headers=headers)
 
 
 @app.post("/inference/stream")
@@ -812,7 +853,7 @@ async def inference_stream(request: InferenceRequest, raw_request: Request):
 _hs_rate_limit: dict[str, list[float]] = defaultdict(list)
 _HS_RATE_LIMIT_RPM = 30
 
-@app.post("/hidden_state", response_model=HiddenStateResponse)
+@app.post("/hidden_state")
 async def hidden_state(req: HiddenStateRequest, request: Request):
     if not _verify_validator_token(request, "/hidden_state", req.request_id or "", _get_body_hash(request)):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -823,8 +864,10 @@ async def hidden_state(req: HiddenStateRequest, request: Request):
     _hs_rate_limit[client_ip] = window = [t for t in window if now - t < 60]
     if len(window) >= _HS_RATE_LIMIT_RPM:
         raise HTTPException(status_code=429, detail="hidden_state rate limit exceeded")
-    window.append(now)
-    return await miner.get_hidden_state(req)
+    result = await miner.get_hidden_state(req)
+    body = result.model_dump_json().encode()
+    headers = _sign_response(req.request_id, body)
+    return JSONResponse(content=json.loads(body), headers=headers)
 
 
 # -- CLI -----------------------------------------------------------------------
@@ -878,6 +921,18 @@ def main():
         default=False,
         help="Disable CUDA graph capture for vLLM (slower but avoids compilation hangs)",
     )
+    parser.add_argument(
+        "--wallet", default=None,
+        help="Bittensor wallet name for response signing (e.g., 'miner'). Required for signature auth.",
+    )
+    parser.add_argument(
+        "--hotkey", default="default",
+        help="Bittensor hotkey name (default: 'default')",
+    )
+    parser.add_argument(
+        "--wallet-path", default=None,
+        help="Path to bittensor wallets directory (default: ~/.bittensor/wallets)",
+    )
     args = parser.parse_args()
 
     # Graceful shutdown
@@ -889,6 +944,12 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Load wallet for response signing
+    if args.wallet:
+        _load_wallet(args.wallet, args.hotkey, args.wallet_path)
+    else:
+        log.warning("[SIGN] No --wallet specified. Response signing DISABLED.")
 
     miner = VLLMMiner(
         model_name=args.model,
