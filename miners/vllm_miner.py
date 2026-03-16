@@ -26,18 +26,21 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import os
 import signal
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import AsyncIterator
 
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -96,24 +99,51 @@ class HiddenStateResponse(BaseModel):
 # -- Hidden State Cache --------------------------------------------------------
 
 class HiddenStateCache:
-    """LRU cache for hidden states from inference runs."""
+    """LRU cache for hidden states from inference runs with TTL and query limits."""
+
+    ENTRY_TTL_S = 120  # Entries expire after 120s (covers deferred challenge window)
+    MAX_QUERIES_PER_REQUEST = 5  # Max hidden state queries per request_id
 
     def __init__(self, max_requests: int = 200):
         self.max_requests = max_requests
         self.cache: OrderedDict[str, dict] = OrderedDict()
+        self._timestamps: dict[str, float] = {}  # request_id -> store time
+        self._query_counts: dict[str, int] = {}  # request_id -> query count
         self._lock = asyncio.Lock()
 
     async def store(self, request_id: str, hidden_states: dict):
         """Store hidden states. hidden_states = {layer_idx: tensor(seq_len, hidden_dim)}"""
         async with self._lock:
+            # Evict expired entries
+            now = time.time()
+            expired = [k for k, t in self._timestamps.items() if now - t > self.ENTRY_TTL_S]
+            for k in expired:
+                self.cache.pop(k, None)
+                self._timestamps.pop(k, None)
+                self._query_counts.pop(k, None)
             if len(self.cache) >= self.max_requests:
-                self.cache.popitem(last=False)
+                oldest_key, _ = self.cache.popitem(last=False)
+                self._timestamps.pop(oldest_key, None)
+                self._query_counts.pop(oldest_key, None)
             self.cache[request_id] = hidden_states
+            self._timestamps[request_id] = now
+            self._query_counts[request_id] = 0
 
     async def get(self, request_id: str, layer_index: int, token_index: int) -> np.ndarray | None:
         async with self._lock:
             if request_id not in self.cache:
                 return None
+            # Check TTL
+            if time.time() - self._timestamps.get(request_id, 0) > self.ENTRY_TTL_S:
+                self.cache.pop(request_id, None)
+                self._timestamps.pop(request_id, None)
+                self._query_counts.pop(request_id, None)
+                return None
+            # Check query limit
+            count = self._query_counts.get(request_id, 0)
+            if count >= self.MAX_QUERIES_PER_REQUEST:
+                return None
+            self._query_counts[request_id] = count + 1
             states = self.cache[request_id]
             if layer_index not in states:
                 return None
@@ -678,6 +708,64 @@ class VLLMMiner:
 app = FastAPI(title="vLLM Inference Miner")
 miner: VLLMMiner | None = None
 
+# Validator auth: shared secret for authenticating validator requests.
+# Set MINER_VALIDATOR_SECRET env var to enable. When set to "enforce",
+# unauthenticated requests to /inference and /hidden_state are rejected.
+_MINER_VALIDATOR_SECRET = os.environ.get("MINER_VALIDATOR_SECRET", "")
+# C5-3: Default to enforced — secure by default. Set MINER_AUTH_ENFORCE=false to disable.
+_MINER_AUTH_ENFORCE = os.environ.get("MINER_AUTH_ENFORCE", "true").lower() != "false"
+_auth_warn_count = 0
+
+
+def _verify_validator_token(request: Request, endpoint: str, request_id: str = "", body_hash: str = "") -> bool:
+    """Check X-Validator-Key header with per-request HMAC validation.
+
+    C5-4: HMAC now covers body_hash to prevent relay forgery.
+    sig = HMAC(secret, "miner_auth:{request_id}:{ts}:{body_hash}")
+
+    Returns True if valid or auth disabled.
+    """
+    global _auth_warn_count
+    if not _MINER_VALIDATOR_SECRET:
+        return True
+    token = request.headers.get("X-Validator-Key", "")
+    if not token:
+        _auth_warn_count += 1
+        if _auth_warn_count <= 10 or _auth_warn_count % 100 == 0:
+            log.warning(f"[AUTH] No X-Validator-Key on {endpoint} from {request.client.host if request.client else '?'} (count={_auth_warn_count})")
+        return not _MINER_AUTH_ENFORCE
+
+    # Format: "timestamp:signature" with per-request binding and 60s expiry
+    if ":" in token:
+        parts = token.split(":", 1)
+        ts_str, sig = parts[0], parts[1]
+        try:
+            ts = int(ts_str)
+        except ValueError:
+            log.warning(f"[AUTH] Invalid timestamp in token on {endpoint}")
+            return not _MINER_AUTH_ENFORCE
+        # Check 60-second freshness window (generous for clock skew)
+        age = abs(int(time.time()) - ts)
+        if age > 60:
+            log.warning(f"[AUTH] Expired token on {endpoint} (age={age}s)")
+            return not _MINER_AUTH_ENFORCE
+        # C5-4: HMAC covers body_hash — relay can't forge for different payload
+        msg = f"miner_auth:{request_id}:{ts_str}:{body_hash}".encode()
+        expected = hmac.new(_MINER_VALIDATOR_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, expected):
+            return True
+        # Backwards compat: try without body_hash for rolling upgrade window
+        msg_legacy = f"miner_auth:{request_id}:{ts_str}".encode()
+        expected_legacy = hmac.new(_MINER_VALIDATOR_SECRET.encode(), msg_legacy, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, expected_legacy):
+            return True
+        log.warning(f"[AUTH] Signature mismatch on {endpoint} (new format)")
+        return not _MINER_AUTH_ENFORCE
+
+    # C4 H4-5: Legacy static HMAC skeleton key removed — all miners must use request-bound auth
+    log.warning(f"[AUTH] Invalid X-Validator-Key on {endpoint} from {request.client.host if request.client else '?'}")
+    return not _MINER_AUTH_ENFORCE
+
 
 @app.get("/health")
 async def health():
@@ -690,23 +778,46 @@ async def health():
     }
 
 
+def _get_body_hash(request: Request) -> str:
+    """C5-4: Compute body hash for content-bound HMAC verification."""
+    body_hash = request.headers.get("X-Body-Hash", "")
+    return body_hash
+
 @app.post("/inference", response_model=InferenceResponse)
-async def inference(request: InferenceRequest):
+async def inference(request: InferenceRequest, raw_request: Request):
+    if not _verify_validator_token(raw_request, "/inference", request.request_id or "", _get_body_hash(raw_request)):
+        raise HTTPException(status_code=401, detail="unauthorized")
     return await miner.run_inference(request)
 
 
 @app.post("/inference/stream")
-async def inference_stream(request: InferenceRequest):
+async def inference_stream(request: InferenceRequest, raw_request: Request):
     """SSE streaming inference endpoint. Streams tokens as they are generated."""
+    if not _verify_validator_token(raw_request, "/inference/stream", request.request_id or "", _get_body_hash(raw_request)):
+        raise HTTPException(status_code=401, detail="unauthorized")
     return StreamingResponse(
         miner.run_inference_streaming(request),
         media_type="text/event-stream",
     )
 
 
+# Simple IP rate limiter for hidden_state: max 30 requests/minute per IP
+_hs_rate_limit: dict[str, list[float]] = defaultdict(list)
+_HS_RATE_LIMIT_RPM = 30
+
 @app.post("/hidden_state", response_model=HiddenStateResponse)
-async def hidden_state(request: HiddenStateRequest):
-    return await miner.get_hidden_state(request)
+async def hidden_state(req: HiddenStateRequest, request: Request):
+    if not _verify_validator_token(request, "/hidden_state", req.request_id or "", _get_body_hash(request)):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    window = _hs_rate_limit[client_ip]
+    # Prune entries older than 60s
+    _hs_rate_limit[client_ip] = window = [t for t in window if now - t < 60]
+    if len(window) >= _HS_RATE_LIMIT_RPM:
+        raise HTTPException(status_code=429, detail="hidden_state rate limit exceeded")
+    window.append(now)
+    return await miner.get_hidden_state(req)
 
 
 # -- CLI -----------------------------------------------------------------------
