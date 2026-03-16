@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -835,7 +835,8 @@ async def inference(request: InferenceRequest, raw_request: Request):
     result = await miner.run_inference(request)
     body = result.model_dump_json().encode()
     headers = _sign_response(result.request_id, body)
-    return JSONResponse(content=json.loads(body), headers=headers)
+    headers["content-type"] = "application/json"
+    return Response(content=body, headers=headers)
 
 
 @app.post("/inference/stream")
@@ -867,7 +868,8 @@ async def hidden_state(req: HiddenStateRequest, request: Request):
     result = await miner.get_hidden_state(req)
     body = result.model_dump_json().encode()
     headers = _sign_response(req.request_id, body)
-    return JSONResponse(content=json.loads(body), headers=headers)
+    headers["content-type"] = "application/json"
+    return Response(content=body, headers=headers)
 
 
 # -- CLI -----------------------------------------------------------------------
