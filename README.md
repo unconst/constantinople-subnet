@@ -28,10 +28,11 @@ docker compose up -d
 
 ## Run a Miner
 
-See [miners/README.md](miners/README.md). Requires a GPU (RTX 4090+ recommended).
+See [miners/README.md](miners/README.md) for the full setup guide (registration, PM2, Docker, networking). Requires a GPU (RTX 4090+ recommended).
 
 ```bash
-python miners/vllm_miner.py --model Qwen/Qwen2.5-7B-Instruct --port 8091 --hf-device cpu
+pip install -r miners/requirements.txt
+python miners/vllm_miner.py --model Qwen/Qwen2.5-7B-Instruct --port 8091 --gpu-memory-utilization 0.70 --hf-device cpu
 ```
 
 ## Incentive Mechanics
