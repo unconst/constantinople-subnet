@@ -40,7 +40,7 @@ import time
 import uuid
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Union
 
 import aiohttp
 import numpy as np
@@ -590,12 +590,26 @@ VALID_ROLES = {"system", "user", "assistant", "tool", "function"}
 
 class ChatMessage(BaseModel):
     role: str = Field(..., max_length=32)
-    content: str = Field(..., max_length=100_000)  # 100KB per message max
+    content: Union[str, list] = Field(..., max_length=100_000)  # str or [{type:"text",text:"..."}]
+
+    @property
+    def text(self) -> str:
+        """Extract plain text from content (handles OpenAI multimodal format)."""
+        if isinstance(self.content, str):
+            return self.content
+        # List of content parts — extract text parts, ignore images etc.
+        parts = []
+        for part in self.content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
 
 class ChatCompletionRequest(BaseModel):
     model: str = Field("default", max_length=128, pattern=r'^[a-zA-Z0-9][a-zA-Z0-9/_.\-:]*$')
     messages: list[ChatMessage] = Field(..., max_length=256)  # Max 256 messages
-    max_tokens: int = Field(256, ge=1, le=4096)
+    max_tokens: int = Field(2048, ge=1, le=16384)
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     stream: bool = False
     # Session ID for KV cache routing (multi-turn conversations)
@@ -2779,10 +2793,10 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
         for m in request.messages:
             if m.role not in VALID_ROLES:
                 raise HTTPException(status_code=400, detail=f"Invalid role: {m.role!r}")
-        # Build messages list for chat template
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        # Build messages list for chat template (normalize multimodal content to plain text)
+        messages = [{"role": m.role, "content": m.text} for m in request.messages]
         # Fallback prompt for mock model / synthetic probes
-        prompt = "\n".join(f"{m.role}: {m.content}" for m in request.messages)
+        prompt = "\n".join(f"{m.role}: {m.text}" for m in request.messages)
 
         # Context length guard — prevent miners from getting OOB requests
         max_ctx = validator.config.MAX_CONTEXT_TOKENS
@@ -2866,11 +2880,157 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             ),
         )
 
+    # ── Anthropic Messages API endpoint ──────────────────────────────────
+
+    class AnthropicContentBlock(BaseModel):
+        type: str = "text"
+        text: str = ""
+
+    class AnthropicMessage(BaseModel):
+        role: str = Field(..., max_length=32)
+        content: Union[str, list] = Field(..., max_length=500_000)
+
+    class AnthropicMessagesRequest(BaseModel):
+        model: str = Field("default", max_length=128)
+        max_tokens: int = Field(4096, ge=1, le=32768)
+        messages: list[AnthropicMessage] = Field(..., max_length=256)
+        system: Optional[Union[str, list]] = None
+        stream: bool = False
+        temperature: Optional[float] = Field(None, ge=0.0, le=1.0)
+        top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
+        stop_sequences: Optional[list[str]] = None
+        metadata: Optional[dict] = None
+
+        model_config = {"extra": "ignore"}
+
+    def _extract_text(content) -> str:
+        """Extract plain text from Anthropic content (str or list of blocks)."""
+        if isinstance(content, str):
+            return content
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+
+    def _anthropic_to_openai_messages(request: AnthropicMessagesRequest) -> list[ChatMessage]:
+        """Convert Anthropic Messages format to OpenAI ChatMessage list."""
+        msgs = []
+        if request.system:
+            sys_text = _extract_text(request.system)
+            msgs.append(ChatMessage(role="system", content=sys_text))
+        for m in request.messages:
+            text = _extract_text(m.content)
+            msgs.append(ChatMessage(role=m.role, content=text))
+        return msgs
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(
+        request: AnthropicMessagesRequest,
+        raw_request: Request,
+    ):
+        """Anthropic Messages API endpoint — translates to internal OpenAI format."""
+        # Auth: accept both x-api-key (Anthropic) and Authorization: Bearer (OpenAI)
+        api_key = raw_request.headers.get("x-api-key") or ""
+        auth_header = raw_request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer ") and not api_key:
+            api_key = auth_header[7:]
+        if not api_key:
+            raise HTTPException(status_code=401, detail="Missing API key")
+        # Rate limit using same mechanism
+        await rate_limit(raw_request)
+
+        # Convert to OpenAI message format
+        oai_messages = _anthropic_to_openai_messages(request)
+
+        # Validate roles
+        for m in oai_messages:
+            if m.role not in VALID_ROLES:
+                raise HTTPException(status_code=400, detail=f"Invalid role: {m.role!r}")
+
+        messages = [{"role": m.role, "content": m.text} for m in oai_messages]
+        prompt = "\n".join(f"{m.role}: {m.text}" for m in oai_messages)
+
+        # Context length guard
+        max_ctx = validator.config.MAX_CONTEXT_TOKENS
+        if hasattr(validator.model, 'tokenizer') and validator.model.tokenizer:
+            try:
+                if hasattr(validator.model.tokenizer, 'apply_chat_template'):
+                    est_text = validator.model.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    est_text = prompt
+                est_prompt_tokens = len(validator.model.tokenizer.encode(est_text))
+            except Exception:
+                est_prompt_tokens = len(prompt) // 3
+        else:
+            est_prompt_tokens = len(prompt) // 3
+        if est_prompt_tokens >= max_ctx:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prompt too long: ~{est_prompt_tokens} tokens exceeds model context of {max_ctx}.",
+            )
+        max_tokens = request.max_tokens
+        if est_prompt_tokens + max_tokens > max_ctx:
+            max_tokens = max(1, max_ctx - est_prompt_tokens)
+
+        # Sampling params
+        sampling_params = {}
+        if request.temperature is not None:
+            sampling_params["temperature"] = request.temperature
+        if request.top_p is not None:
+            sampling_params["top_p"] = request.top_p
+        if request.stop_sequences:
+            sampling_params["stop"] = request.stop_sequences
+
+        if request.stream:
+            return StreamingResponse(
+                _stream_anthropic_response(
+                    validator, prompt, max_tokens, request.model,
+                    messages=messages, sampling_params=sampling_params,
+                ),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming
+        result = await validator.process_request(
+            prompt,
+            max_tokens=max_tokens,
+            is_synthetic=False,
+            messages=messages,
+            sampling_params=sampling_params,
+        )
+
+        if result is None:
+            raise HTTPException(status_code=503, detail="No miners available")
+
+        out_tokens = result["output_tokens"]
+        if isinstance(out_tokens, list):
+            out_tokens = len(out_tokens)
+        stop_reason = "max_tokens" if out_tokens >= max_tokens else "end_turn"
+
+        return JSONResponse(content={
+            "id": f"msg_{result['request_id'][:24]}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": result["text"]}],
+            "model": request.model,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": result["input_tokens"],
+                "output_tokens": out_tokens,
+            },
+        })
+
     # ── Legacy inference endpoint ────────────────────────────────────────
 
     class LegacyRequest(BaseModel):
         prompt: str = Field(..., max_length=100_000)
-        max_tokens: int = Field(64, ge=1, le=4096)
+        max_tokens: int = Field(64, ge=1, le=16384)
         stream: bool = False
 
     class LegacyResponse(BaseModel):
@@ -3361,7 +3521,7 @@ except Exception as e:
     class CompletionRequest(BaseModel):
         model: str = "default"
         prompt: str = Field(..., max_length=100_000)
-        max_tokens: int = Field(64, ge=1, le=4096)
+        max_tokens: int = Field(64, ge=1, le=16384)
         temperature: float = Field(0.7, ge=0.0, le=2.0)
         stream: bool = False
 
@@ -3875,6 +4035,172 @@ async def _stream_response(
     }
     yield f"data: {json.dumps(final)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+async def _stream_anthropic_response(
+    validator,
+    prompt: str,
+    max_tokens: int,
+    model: str,
+    messages: list = None,
+    sampling_params: dict = None,
+) -> AsyncGenerator[str, None]:
+    """Stream response in Anthropic Messages SSE format.
+
+    Internally uses the same miner routing as OpenAI streaming, but emits
+    Anthropic-format SSE events (message_start, content_block_start/delta/stop,
+    message_delta, message_stop).
+    """
+    request_id = str(uuid.uuid4())
+    msg_id = f"msg_{request_id[:24]}"
+
+    # Select miner
+    miner = validator.router.select_miner()
+    if not miner:
+        # Emit an error as an Anthropic-style error event
+        err = {"type": "error", "error": {"type": "overloaded_error", "message": "No miners available"}}
+        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+        return
+
+    # Build payload for miner (same as OpenAI streaming path)
+    payload = {
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "request_id": request_id,
+    }
+    if messages:
+        payload["messages"] = messages
+    if sampling_params:
+        for key in ("temperature", "top_p", "stop"):
+            if sampling_params.get(key) is not None:
+                payload[key] = sampling_params[key]
+
+    # Dummy challenge fields (no verification on Anthropic path for now)
+    dummy = validator._generate_dummy_challenge_fields(max_tokens, prompt=prompt, messages=messages)
+    payload["challenge_layer"] = dummy["challenge_layer"]
+    payload["challenge_token"] = dummy["challenge_token"]
+    if "challenge_extra" in dummy:
+        payload["challenge_extra"] = dummy["challenge_extra"]
+
+    # Emit message_start
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+
+    # Emit content_block_start
+    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+
+    # Emit ping
+    yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+
+    miner.active_requests += 1
+    all_text = ""
+    streamed_ok = False
+    input_tokens = 0
+    output_tokens = 0
+
+    try:
+        stream_url = f"{miner.endpoint}/inference/stream"
+        session = await validator._get_http_session()
+        try:
+            async with session.post(
+                stream_url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=validator.config.INFERENCE_TIMEOUT_S),
+            ) as resp:
+                if resp.status == 200 and resp.content_type == "text/event-stream":
+                    streamed_ok = True
+                    sse_buffer = ""
+                    done_seen = False
+                    async for raw_chunk in resp.content.iter_any():
+                        sse_buffer += raw_chunk.decode("utf-8", errors="replace")
+                        while "\n\n" in sse_buffer:
+                            event, sse_buffer = sse_buffer.split("\n\n", 1)
+                            line = event.strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                done_seen = True
+                                break
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+
+                            token_text = data.get("token", "")
+                            finish = data.get("finish_reason")
+
+                            if finish == "stop":
+                                input_tokens = data.get("input_tokens", 0)
+                                output_tokens = data.get("output_tokens", 0)
+                                if isinstance(output_tokens, list):
+                                    output_tokens = len(output_tokens)
+                            elif token_text:
+                                all_text += token_text
+                                # Emit content_block_delta
+                                delta_event = {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "text_delta", "text": token_text},
+                                }
+                                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                        if done_seen:
+                            break
+        except (asyncio.TimeoutError, aiohttp.ClientError, Exception) as e:
+            log.warning(f"Anthropic stream: miner {miner.uid} error: {e}")
+            validator.router.report_failure(miner)
+            streamed_ok = False
+
+        if not streamed_ok:
+            # Fallback: non-streaming request
+            result = await validator.process_request(
+                prompt,
+                max_tokens=max_tokens,
+                is_synthetic=False,
+                messages=messages,
+                sampling_params=sampling_params,
+            )
+            if result:
+                all_text = result.get("text", "")
+                input_tokens = result.get("input_tokens", 0)
+                out = result.get("output_tokens", 0)
+                output_tokens = out if isinstance(out, int) else len(out)
+                # Emit all text as a single delta
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": all_text},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+            else:
+                all_text = "Error: no miners available"
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": all_text},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+    finally:
+        miner.active_requests = max(0, miner.active_requests - 1)
+
+    if streamed_ok:
+        try:
+            validator.router.report_success(miner, ttft_ms=0.0, tps=0.0)
+        except Exception:
+            pass
+        validator.total_organic += 1
+
+    # Estimate tokens if not reported
+    if not output_tokens:
+        output_tokens = len(all_text.split())
+    if not input_tokens:
+        input_tokens = len(prompt) // 4
+
+    stop_reason = "max_tokens" if output_tokens >= max_tokens else "end_turn"
+
+    # Emit closing events
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 # ── CLI Runner ───────────────────────────────────────────────────────────────
