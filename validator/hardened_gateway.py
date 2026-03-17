@@ -1142,6 +1142,7 @@ class HardenedGatewayValidator:
         # Stats
         self.total_organic = 0
         self.total_synthetic = 0
+        self.active_organic_requests = 0  # In-flight organic requests (for synthetic throttling)
         self.total_timeouts = 0
         self.total_miner_errors = 0
         self.total_failovers = 0
@@ -1867,6 +1868,27 @@ class HardenedGatewayValidator:
         Full request processing pipeline with hardened verification.
         Includes failover: if first miner fails, retry with another.
         """
+        # Track in-flight organic requests so synthetic probes can yield capacity
+        if not is_synthetic:
+            self.active_organic_requests += 1
+        try:
+            return await self._process_request_inner(
+                prompt, max_tokens, is_synthetic, session_id, messages, sampling_params
+            )
+        finally:
+            if not is_synthetic:
+                self.active_organic_requests = max(0, self.active_organic_requests - 1)
+
+    async def _process_request_inner(
+        self,
+        prompt: str,
+        max_tokens: int = 64,
+        is_synthetic: bool = False,
+        session_id: Optional[str] = None,
+        messages: list = None,
+        sampling_params: dict = None,
+    ) -> Optional[dict]:
+        """Inner implementation of process_request."""
         # Select miner
         miner = self.router.select_miner(session_id=session_id)
         if not miner:
@@ -2572,6 +2594,10 @@ class HardenedGatewayValidator:
         """Background loop with randomized timing to prevent detection."""
         while True:
             try:
+                # Yield capacity to organic requests — skip probe if users are waiting
+                if self.active_organic_requests > 0:
+                    await asyncio.sleep(2)
+                    continue
                 await self.run_synthetic_probe()
                 # Randomized interval (±50%) — miners can't predict timing
                 base = self.config.SYNTHETIC_INTERVAL_S
@@ -2589,6 +2615,10 @@ class HardenedGatewayValidator:
         """Background loop for KV cache probes with randomized timing."""
         while True:
             try:
+                # Yield capacity to organic requests
+                if self.active_organic_requests > 0:
+                    await asyncio.sleep(2)
+                    continue
                 await self.run_cache_probe()
                 # Randomized interval
                 base = self.config.CACHE_PROBE_INTERVAL_S
@@ -2606,6 +2636,10 @@ class HardenedGatewayValidator:
         """Background loop for active collusion cross-probing."""
         while True:
             try:
+                # Yield capacity to organic requests
+                if self.active_organic_requests > 0:
+                    await asyncio.sleep(2)
+                    continue
                 await self.run_cross_probe()
                 # Cross-probes are resource-intensive (2 inference calls each)
                 # Run less frequently than synthetic probes: every 30-90s
@@ -3097,6 +3131,7 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             "epoch_elapsed_s": time.time() - validator.scoring.current_epoch_start,
             "total_organic": validator.total_organic,
             "total_synthetic": validator.total_synthetic,
+            "active_organic_requests": validator.active_organic_requests,
             "r2_records": validator.r2.records_published,
             "miners": validator.scoring.get_scoreboard(),
         }
@@ -3616,6 +3651,25 @@ async def _stream_response(
     Pipes real token-by-token streaming from the miner when available,
     falling back to word-splitting for non-streaming miners.
     """
+    # Track in-flight organic request for synthetic throttling
+    validator.active_organic_requests += 1
+    try:
+        async for chunk in _stream_response_inner(validator, prompt, max_tokens, model, session_id, messages, sampling_params):
+            yield chunk
+    finally:
+        validator.active_organic_requests = max(0, validator.active_organic_requests - 1)
+
+
+async def _stream_response_inner(
+    validator: HardenedGatewayValidator,
+    prompt: str,
+    max_tokens: int,
+    model: str,
+    session_id: Optional[str] = None,
+    messages: list = None,
+    sampling_params: dict = None,
+) -> AsyncGenerator[str, None]:
+    """Inner streaming implementation."""
     # Select miner
     miner = validator.router.select_miner(session_id=session_id)
     if not miner:
