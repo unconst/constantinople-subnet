@@ -2200,6 +2200,18 @@ class HardenedGatewayValidator:
         )
         self.scoring.record_request(score)
 
+        # Log per-request performance metrics
+        challenge_tag = ""
+        if challenge_passed is True:
+            challenge_tag = " | challenge=PASS"
+        elif challenge_passed is False:
+            challenge_tag = " | challenge=FAIL"
+        log.info(
+            f"[REQUEST] uid={miner.uid} ttft={ttft_ms:.0f}ms tps={tps:.1f} "
+            f"tokens={output_token_count} wall={wall_time_ms:.0f}ms "
+            f"{'synthetic' if is_synthetic else 'organic'}{challenge_tag}"
+        )
+
         # Update router blocked UIDs after each scored request
         self.router.update_blocked_uids(self.scoring)
 
@@ -4003,6 +4015,18 @@ async def _stream_response_inner(
                 challenge_passed=challenge_passed,
             )
             validator.scoring.record_request(score)
+
+            # Log per-request performance metrics (streaming path)
+            challenge_tag = ""
+            if challenge_passed is True:
+                challenge_tag = " | challenge=PASS"
+            elif challenge_passed is False:
+                challenge_tag = " | challenge=FAIL"
+            log.info(
+                f"[REQUEST] uid={miner.uid} ttft={ttft_ms:.0f}ms tps={tps:.1f} "
+                f"tokens={streamed_token_count} wall={wall_time_ms:.0f}ms "
+                f"organic/stream{challenge_tag}"
+            )
 
             # Update router blocked UIDs after each scored request
             validator.router.update_blocked_uids(validator.scoring)
