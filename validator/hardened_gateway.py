@@ -462,9 +462,9 @@ class GatewayConfig:
     CHALLENGE_TIMEOUT_MS = CHALLENGE_TIMEOUT_MS
 
     # Inference
-    INFERENCE_TIMEOUT_S = 30
+    INFERENCE_TIMEOUT_S = 120
     MAX_MINER_RESPONSE_BYTES = 10 * 1024 * 1024  # 10MB max response from miners
-    MAX_CONTEXT_TOKENS = 4096  # Max context window (prompt + output tokens)
+    MAX_CONTEXT_TOKENS = 32768  # Max context window (prompt + output tokens)
 
     # Epoch
     EPOCH_LENGTH_S = 60  # PoC: 60s, production: 4320s
@@ -609,7 +609,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = Field("default", max_length=128, pattern=r'^[a-zA-Z0-9][a-zA-Z0-9/_.\-:]*$')
     messages: list[ChatMessage] = Field(..., max_length=256)  # Max 256 messages
-    max_tokens: int = Field(2048, ge=1, le=16384)
+    max_tokens: int = Field(2048, ge=1, le=32768)
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     stream: bool = False
     # Session ID for KV cache routing (multi-turn conversations)
@@ -905,8 +905,12 @@ class IntelligentRouter:
         else:
             miner.avg_tps = miner.avg_tps * (1 - sa) + tps * sa
 
-    def report_failure(self, miner: MinerInfo):
-        """Update miner stats after failed request."""
+    def report_failure(self, miner: MinerInfo, timeout: bool = False):
+        """Update miner stats after failed request.
+
+        Args:
+            timeout: If True, use softer penalty (timeouts on large contexts are expected).
+        """
         miner.requests_failed += 1
         miner.active_requests = max(0, miner.active_requests - 1)
 
@@ -915,8 +919,9 @@ class IntelligentRouter:
         if miner.requests_served == 0 and miner.requests_failed >= 3:
             miner.reliability_score = 0.0
         else:
-            # Use 0.3 alpha (3x normal) so dead miners are detected in ~7 failures
-            alpha = 0.3
+            # Timeouts get softer penalty (0.1 alpha) — they're expected for large contexts
+            # Hard failures get 0.3 alpha so dead miners are detected in ~7 failures
+            alpha = 0.1 if timeout else 0.3
             miner.reliability_score = miner.reliability_score * (1 - alpha)
 
         # Mark dead if too unreliable
@@ -1389,7 +1394,7 @@ class HardenedGatewayValidator:
         except asyncio.TimeoutError:
             log.warning(f"Miner {miner.uid} timed out ({self.config.INFERENCE_TIMEOUT_S}s)")
             self.total_timeouts += 1
-            self.router.report_failure(miner)
+            self.router.report_failure(miner, timeout=True)
             return None
         except Exception as e:
             log.debug(f"Miner {miner.uid} error: {e}")
@@ -2721,7 +2726,7 @@ class HardenedGatewayValidator:
             try:
                 session = await self._get_http_session()
                 await self.router.health_check_dead_miners(session=session)
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)  # Fast recovery for agent workloads (was 30s)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3020,11 +3025,19 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
         if request.stop_sequences:
             sampling_params["stop"] = request.stop_sequences
 
+        # Session ID for KV cache affinity (from metadata or header)
+        session_id = None
+        if request.metadata and isinstance(request.metadata, dict):
+            session_id = request.metadata.get("session_id")
+        if not session_id:
+            session_id = raw_request.headers.get("x-session-id")
+
         if request.stream:
             return StreamingResponse(
                 _stream_anthropic_response(
                     validator, prompt, max_tokens, request.model,
                     messages=messages, sampling_params=sampling_params,
+                    session_id=session_id,
                 ),
                 media_type="text/event-stream",
             )
@@ -3034,6 +3047,7 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             prompt,
             max_tokens=max_tokens,
             is_synthetic=False,
+            session_id=session_id,
             messages=messages,
             sampling_params=sampling_params,
         )
@@ -3064,7 +3078,7 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
 
     class LegacyRequest(BaseModel):
         prompt: str = Field(..., max_length=100_000)
-        max_tokens: int = Field(64, ge=1, le=16384)
+        max_tokens: int = Field(64, ge=1, le=32768)
         stream: bool = False
 
     class LegacyResponse(BaseModel):
@@ -3556,7 +3570,7 @@ except Exception as e:
     class CompletionRequest(BaseModel):
         model: str = "default"
         prompt: str = Field(..., max_length=100_000)
-        max_tokens: int = Field(64, ge=1, le=16384)
+        max_tokens: int = Field(64, ge=1, le=32768)
         temperature: float = Field(0.7, ge=0.0, le=2.0)
         stream: bool = False
 
@@ -3826,7 +3840,7 @@ async def _stream_response_inner(
         except asyncio.TimeoutError:
             log.warning(f"Miner {miner.uid}: streaming timeout ({validator.config.INFERENCE_TIMEOUT_S}s)")
             validator.total_timeouts += 1
-            validator.router.report_failure(miner)
+            validator.router.report_failure(miner, timeout=True)
             _counter_decremented = True
             streamed_ok = False
             # Send error chunk to client if we already started streaming tokens
@@ -4098,6 +4112,7 @@ async def _stream_anthropic_response(
     model: str,
     messages: list = None,
     sampling_params: dict = None,
+    session_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream response in Anthropic Messages SSE format.
 
@@ -4108,13 +4123,17 @@ async def _stream_anthropic_response(
     request_id = str(uuid.uuid4())
     msg_id = f"msg_{request_id[:24]}"
 
-    # Select miner
-    miner = validator.router.select_miner()
+    # Select miner (with session affinity for KV cache reuse)
+    miner = validator.router.select_miner(session_id=session_id)
     if not miner:
         # Emit an error as an Anthropic-style error event
         err = {"type": "error", "error": {"type": "overloaded_error", "message": "No miners available"}}
         yield f"event: error\ndata: {json.dumps(err)}\n\n"
         return
+
+    # Register session affinity for future requests (KV cache reuse)
+    if session_id:
+        validator.router.session_router.set_affinity(session_id, miner.uid)
 
     # Build payload for miner (same as OpenAI streaming path)
     payload = {
@@ -4963,7 +4982,7 @@ def main():
     parser.add_argument("--network", default="finney", help="Bittensor network (finney/test/local/ws://...)")
     parser.add_argument("--wallet-path", default=None, help="Wallet directory path")
     parser.add_argument("--auditor-url", default=None, help="External audit_validator URL to fetch challenge data for routing")
-    parser.add_argument("--max-context-tokens", type=int, default=4096, help="Max context window (prompt+output tokens) — prevents OOB errors on miners")
+    parser.add_argument("--max-context-tokens", type=int, default=32768, help="Max context window (prompt+output tokens) — prevents OOB errors on miners")
     args = parser.parse_args()
 
     if not args.miners and not args.discover:
