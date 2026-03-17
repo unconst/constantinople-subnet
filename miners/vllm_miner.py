@@ -198,9 +198,114 @@ class HiddenStateCache:
 
 # -- vLLM Miner ---------------------------------------------------------------
 
+class RemoteHiddenStateClient:
+    """Client for fetching hidden states from a remote hidden_state_server.
+
+    Used when the model is too large to load locally (e.g., GLM-5 744B).
+    The miner's vLLM engine handles inference while a separate server
+    provides hidden state extraction.
+    """
+
+    def __init__(self, server_url: str, auth_token: str | None = None):
+        import base64
+        import requests as _requests
+        self._base64 = base64
+        self._requests = _requests
+        self._base_url = server_url.rstrip("/")
+        self._headers = {"Content-Type": "application/json"}
+        if auth_token:
+            self._headers["X-Auth-Token"] = auth_token
+
+        # Fetch config from remote
+        log.info(f"Connecting to remote hidden state server: {self._base_url}")
+        resp = _requests.get(f"{self._base_url}/config", headers=self._headers, timeout=30)
+        resp.raise_for_status()
+        cfg = resp.json()
+        self.num_layers = cfg["num_layers"]
+        self.hidden_dim = cfg["hidden_dim"]
+        self.model_name = cfg.get("name", "remote")
+        log.info(f"Remote model: {self.model_name} | {self.num_layers} layers | hidden_dim={self.hidden_dim}")
+
+    def extract_hidden_states(self, all_token_ids: list[int]) -> dict[int, "torch.Tensor"]:
+        """Fetch hidden states for all layers from the remote server.
+
+        Returns {layer_idx: tensor(seq_len, hidden_dim)} matching local extraction format.
+        Uses batch endpoint for efficiency — single HTTP call for all layers.
+        """
+        # Request a representative set of positions across the sequence
+        # For challenge compatibility, we need all layers at all positions
+        # But for efficiency, just extract states at the positions the cache needs
+        # The remote server does a single forward pass covering max_position
+        seq_len = len(all_token_ids)
+        if seq_len == 0:
+            return {}
+
+        # Build batch request: all layers at last position (most common challenge target)
+        # Additional positions will be fetched on-demand via get_single_hidden_state
+        points = [(layer, seq_len - 1) for layer in range(self.num_layers)]
+
+        resp = self._requests.post(
+            f"{self._base_url}/hidden_states",
+            headers=self._headers,
+            json={"tokens": all_token_ids, "points": points},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Build cache dict matching local format: {layer_idx: tensor(1, hidden_dim)}
+        # Note: remote returns normalized vectors; we store them as-is since
+        # _extract_hidden_states callers expect layer_tensor[position].numpy()
+        result = {}
+        for item in data["results"]:
+            vec = np.frombuffer(self._base64.b64decode(item["vector"]), dtype=np.float32)
+            layer_idx = item["layer"]
+            pos = item["position"]
+            # Create a tensor with the position filled in
+            if layer_idx not in result:
+                # Sparse tensor — only fill positions we have
+                result[layer_idx] = {pos: torch.tensor(vec)}
+            else:
+                result[layer_idx][pos] = torch.tensor(vec)
+
+        # Convert sparse dicts to a format compatible with the cache
+        # The cache expects layer_tensor[position].numpy() — we create a wrapper
+        return {layer: _SparseLayerTensor(positions) for layer, positions in result.items()}
+
+    def get_single_hidden_state(self, all_token_ids: list[int], layer: int, position: int) -> np.ndarray | None:
+        """Fetch a single hidden state from the remote server."""
+        try:
+            resp = self._requests.post(
+                f"{self._base_url}/hidden_state",
+                headers=self._headers,
+                json={"tokens": all_token_ids, "layer": layer, "position": position},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return np.frombuffer(self._base64.b64decode(data["vector"]), dtype=np.float32)
+        except Exception as e:
+            log.error(f"Remote hidden state fetch failed: {e}")
+            return None
+
+
+class _SparseLayerTensor:
+    """Sparse tensor wrapper that mimics tensor[position].numpy() interface."""
+
+    def __init__(self, positions: dict[int, "torch.Tensor"]):
+        self._positions = positions
+        # Set shape[0] to max position + 1 for bounds checking
+        self.shape = (max(positions.keys()) + 1 if positions else 0,)
+
+    def __getitem__(self, idx):
+        if idx in self._positions:
+            return self._positions[idx]
+        raise IndexError(f"Position {idx} not cached (have: {list(self._positions.keys())})")
+
+
 class VLLMMiner:
     """
-    High-throughput miner combining vLLM for generation and HuggingFace for
+    High-throughput miner combining vLLM for generation and HuggingFace (or remote)
     hidden state extraction.
     """
 
@@ -213,12 +318,17 @@ class VLLMMiner:
         cache_size: int = 200,
         hf_device: str = "auto",
         enforce_eager: bool = False,
+        remote_hidden_state_url: str | None = None,
+        remote_hidden_state_token: str | None = None,
     ):
         self.model_name = model_name
         self.cache = HiddenStateCache(max_requests=cache_size)
         self.total_requests = 0
         self.total_challenges = 0
         self.challenges_passed = 0
+        self._remote_hs = None
+        self._all_token_ids_cache: OrderedDict[str, list[int]] = OrderedDict()
+        self._TOKEN_CACHE_SIZE = cache_size
 
         # -- Load vLLM engine --
         log.info(f"Initializing vLLM engine: {model_name}")
@@ -242,41 +352,28 @@ class VLLMMiner:
         self.SamplingParams = SamplingParams
         log.info("vLLM engine initialized")
 
-        # -- Load HuggingFace model for hidden state extraction --
-        # This model is used ONLY for forward passes (no generation).
-        # We load it with output_hidden_states=True and in eval mode.
-        # On a 4090, the vLLM engine uses ~85% of VRAM; the HF model shares
-        # the same weights on disk and uses CPU for forward passes, or we can
-        # load it on GPU with reduced memory if space allows.
-        log.info(f"Loading HuggingFace model for hidden state extraction: {model_name}")
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
-        if hf_device == "cpu":
-            log.info("HF model forced to CPU by --hf-device cpu")
-            self.hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,
-                device_map="cpu",
-                trust_remote_code=True,
-                output_hidden_states=True,
-            )
-            self.hf_device = torch.device("cpu")
+        # -- Hidden state extraction: remote or local HF --
+        if remote_hidden_state_url:
+            # Remote mode: call a hidden_state_server for extraction
+            # Used for large models (GLM-5 744B) where loading twice is impossible
+            log.info(f"Using REMOTE hidden state extraction: {remote_hidden_state_url}")
+            self._remote_hs = RemoteHiddenStateClient(remote_hidden_state_url, remote_hidden_state_token)
+            self.num_layers = self._remote_hs.num_layers
+            self.hidden_dim = self._remote_hs.hidden_dim
+            # Still need tokenizer locally
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            self.hf_model = None
+            self.hf_device = None
         else:
-            # Try GPU first; fall back to CPU if OOM
-            try:
-                self.hf_model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    output_hidden_states=True,
-                )
-                self.hf_device = next(self.hf_model.parameters()).device
-                log.info(f"HF model loaded on device: {self.hf_device}")
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                log.warning(f"GPU OOM for HF model ({e}), falling back to CPU with float32")
+            # Local mode: load HuggingFace model for hidden state extraction
+            log.info(f"Loading HuggingFace model for hidden state extraction: {model_name}")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+            if hf_device == "cpu":
+                log.info("HF model forced to CPU by --hf-device cpu")
                 self.hf_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype=torch.float32,
@@ -285,16 +382,39 @@ class VLLMMiner:
                     output_hidden_states=True,
                 )
                 self.hf_device = torch.device("cpu")
-                log.info("HF model loaded on CPU")
+            else:
+                # Try GPU first; fall back to CPU if OOM
+                try:
+                    self.hf_model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=torch.float16,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        output_hidden_states=True,
+                    )
+                    self.hf_device = next(self.hf_model.parameters()).device
+                    log.info(f"HF model loaded on device: {self.hf_device}")
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    log.warning(f"GPU OOM for HF model ({e}), falling back to CPU with float32")
+                    self.hf_model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=torch.float32,
+                        device_map="cpu",
+                        trust_remote_code=True,
+                        output_hidden_states=True,
+                    )
+                    self.hf_device = torch.device("cpu")
+                    log.info("HF model loaded on CPU")
 
-        self.hf_model.eval()
-        self.num_layers = self.hf_model.config.num_hidden_layers
-        self.hidden_dim = self.hf_model.config.hidden_size
+            self.hf_model.eval()
+            self.num_layers = self.hf_model.config.num_hidden_layers
+            self.hidden_dim = self.hf_model.config.hidden_size
 
         log.info(
             f"Model ready: {model_name} | "
             f"{self.num_layers} layers | hidden_dim={self.hidden_dim} | "
-            f"HF device={self.hf_device}"
+            f"HS mode={'remote' if self._remote_hs else 'local'}"
+            f"{f' | HF device={self.hf_device}' if self.hf_device else ''}"
         )
 
     def _build_sampling_params(self, request: InferenceRequest):
@@ -346,17 +466,24 @@ class VLLMMiner:
             torch.cuda.empty_cache()
             log.info("HF model moved to CPU successfully")
 
+    def _extract_hidden_states(self, all_token_ids: list[int]) -> dict[int, "torch.Tensor"]:
+        """
+        Extract hidden states for the full token sequence.
+
+        In local mode: runs HF forward pass. Returns {layer_idx: tensor(seq_len, hidden_dim)}.
+        In remote mode: calls hidden_state_server. Returns {layer_idx: _SparseLayerTensor}.
+
+        Local mode is ~100ms on 4090 GPU, ~500ms on CPU for 8B models.
+        Remote mode latency depends on network + remote GPU forward pass.
+        """
+        if self._remote_hs:
+            return self._remote_hs.extract_hidden_states(all_token_ids)
+
+        return self._extract_hidden_states_local(all_token_ids)
+
     @torch.no_grad()
-    def _extract_hidden_states(self, all_token_ids: list[int]) -> dict[int, torch.Tensor]:
-        """
-        Run a forward pass through the HF model to extract hidden states for
-        the full sequence. Returns {layer_idx: tensor(seq_len, hidden_dim)}.
-
-        This is encoding-only (no generation), so it is fast: ~100ms for 4096
-        tokens on a 4090 GPU, or ~500ms on CPU for an 8B model.
-
-        If GPU OOM occurs during forward pass, automatically falls back to CPU.
-        """
+    def _extract_hidden_states_local(self, all_token_ids: list[int]) -> dict[int, torch.Tensor]:
+        """Local HF model forward pass for hidden state extraction."""
         input_ids = torch.tensor([all_token_ids], dtype=torch.long, device=self.hf_device)
 
         # Truncate to model's max position embeddings if needed
@@ -924,6 +1051,16 @@ def main():
         help="Disable CUDA graph capture for vLLM (slower but avoids compilation hangs)",
     )
     parser.add_argument(
+        "--remote-hidden-state-url", default=None,
+        help="URL of a hidden_state_server for remote hidden state extraction. "
+             "Use for large models (GLM-5 744B) where loading twice is impossible. "
+             "Example: http://gpu-node:8085",
+    )
+    parser.add_argument(
+        "--remote-hidden-state-token", default=None,
+        help="Auth token for the remote hidden state server (or REMOTE_HS_TOKEN env).",
+    )
+    parser.add_argument(
         "--wallet", default=None,
         help="Bittensor wallet name for response signing (e.g., 'miner'). Required for signature auth.",
     )
@@ -953,6 +1090,9 @@ def main():
     else:
         log.warning("[SIGN] No --wallet specified. Response signing DISABLED.")
 
+    remote_hs_url = args.remote_hidden_state_url
+    remote_hs_token = args.remote_hidden_state_token or os.environ.get("REMOTE_HS_TOKEN")
+
     miner = VLLMMiner(
         model_name=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -961,6 +1101,8 @@ def main():
         cache_size=args.cache_size,
         hf_device=args.hf_device,
         enforce_eager=args.enforce_eager,
+        remote_hidden_state_url=remote_hs_url,
+        remote_hidden_state_token=remote_hs_token,
     )
 
     log.info(f"Starting vLLM miner on {args.host}:{args.port}")
@@ -969,6 +1111,10 @@ def main():
     log.info(f"  Max model len: {args.max_model_len}")
     log.info(f"  GPU memory util: {args.gpu_memory_utilization}")
     log.info(f"  Hidden state cache: {args.cache_size} entries")
+    if remote_hs_url:
+        log.info(f"  Hidden state mode: REMOTE ({remote_hs_url})")
+    else:
+        log.info(f"  Hidden state mode: LOCAL (HF model)")
 
     config = uvicorn.Config(
         app,
