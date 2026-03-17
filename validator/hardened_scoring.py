@@ -1262,19 +1262,17 @@ class HardenedScoringEngine:
 
         Includes fully-penalized weights (cache miss, divergence, suspect, etc.)
         so consumers don't need to recompute penalties from raw net_points.
-        Cached for 60s. NEVER blocks longer than the cache lookup — returns stale
-        data (or empty) rather than computing on the hot path.
+        Cached for 10s. Recomputes when stale if miner_stats has data.
         """
         now = time.time()
         if hasattr(self, '_scoreboard_cache') and now - self._scoreboard_cache_time < 10:
             return self._scoreboard_cache
-        # If cache is stale but exists, return it rather than blocking.
-        # The epoch_loop will refresh the cache when it calls compute_weights().
-        if hasattr(self, '_scoreboard_cache'):
-            # Mark as recently refreshed to prevent re-trying for 60s
-            self._scoreboard_cache_time = now
-            return self._scoreboard_cache
-        # First call — compute synchronously (only happens once at startup)
+        # If miner_stats is empty (epoch just reset), return stale cache if available
+        if not self.miner_stats:
+            if hasattr(self, '_scoreboard_cache'):
+                return self._scoreboard_cache
+            return []
+        # Recompute from current epoch data
         live_weights = self.compute_weights()
         board = []
         for uid, stats in self.miner_stats.items():
