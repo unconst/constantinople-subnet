@@ -4373,7 +4373,7 @@ async def run_gateway(args):
                             validator.router.update_auditor_blocked(blocked)
                             log.info(f"[AUDITOR-POLL] Synced {len(data.get('miners', []))} miners ({synced} with voids), blocked={len(blocked)}")
                 except Exception as e:
-                    log.warning(f"[AUDITOR-POLL] Scoreboard error: {e}")
+                    log.warning(f"[AUDITOR-POLL] Scoreboard error: {type(e).__name__}: {e}")
 
                 # Separate try block for health poll — don't let it crash the scoreboard sync
                 try:
@@ -4391,7 +4391,7 @@ async def run_gateway(args):
                                     if stats.passed_challenges == 0 and stats.failed_challenges == 0:
                                         stats.passed_challenges = 1  # Virtual pass from trust
                 except Exception as e:
-                    log.warning(f"[AUDITOR-POLL] Health error: {e}")
+                    log.warning(f"[AUDITOR-POLL] Health error: {type(e).__name__}: {e}")
 
                 await asyncio.sleep(30)
         finally:
